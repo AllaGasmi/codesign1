@@ -1,21 +1,5 @@
 """
 LAB 1 – Part B : Multi-device matrix multiplication
-=====================================================
-Splits an 8192×8192 matrix multiplication across:
-  • RTX 3050  – NAIVE  (uncoalesced, intentionally slow)
-  • Intel Iris Xe – BEST (K9: prefetch + 2-D register)
-
-The row-split is computed so both GPUs finish simultaneously,
-maximising hardware utilisation.
-
-Speedup = GFLOPS(2 GPUs parallel) / GFLOPS(RTX 3050 NAIVE alone)
-
-File layout
------------
-lab1/
-  kernels/kernels.cl   ← all OpenCL kernel source code
-  part_A/benchmark.py
-  part_B/multidev.py   ← this file
 """
 
 import pyopencl as cl
@@ -23,21 +7,19 @@ import numpy as np
 import time
 import os
 
-# ── Configuration ────────────────────────────────────────────
-N         = 8192
+N = 1024  
 TILE_SIZE = 16
-TSM       = 128
-TSN       = 128
-TSK       = 16
-WPTM      = 8
-WPTN      = 8
-WIDTH     = 4
-WPT       = 4
-RTSM      = TSM // WPTM   # 16
-RTSN      = TSN // WPTN   # 16
+TSM = 128
+TSN = 128
+TSK = 16
+WPTM = 8
+WPTN = 8
+WIDTH = 4
+WPT = 4
+RTSM = TSM // WPTM   # 16
+RTSN = TSN // WPTN   # 16
 
-# ── Load & inject defines into kernel source ─────────────────
-_HERE       = os.path.dirname(os.path.abspath(__file__))
+_HERE = os.path.dirname(os.path.abspath(__file__))
 _KERNEL_SRC = os.path.join(_HERE, "..", "kernels", "kernels.cl")
 
 with open(_KERNEL_SRC) as f:
@@ -58,7 +40,7 @@ DEFINES = f"""
 
 # Part B uses partial kernels with a row_offset parameter
 PARTIAL_KERNELS = DEFINES + """
-// ── NAIVE partial (RTX 3050) ──────────────────────────────
+// ── NAIVE partial (GPU 0) ──────────────────────────────
 __kernel void matmul_naive_partial(
     __global float* A,
     __global float* B,
@@ -74,245 +56,240 @@ __kernel void matmul_naive_partial(
     C[row*N_full + col] = sum;
 }
 
-// ── BEST partial (Intel Iris Xe) ──────────────────────────
+// ── BEST partial (GPU 1) - VOTRE K9 DE LA PARTIE A ──────────
 __kernel void matmul_best_partial(
-    __global float* A,
-    __global float* B,
-    __global float* C,
+    __global float4* A,
+    __global float4* B,
+    __global float*  C,
     int N_full,
     int row_offset)
 {
-    __local float Asub[2][TSK][TSM];
-    __local float Bsub[2][TSN][TSK];
-
-    int tidm    = get_local_id(0);
-    int tidn    = get_local_id(1);
-    int offsetM = TSM * get_group_id(0) + row_offset;
-    int offsetN = TSN * get_group_id(1);
-
-    float acc[WPTM][WPTN];
-    for (int wm = 0; wm < WPTM; wm++)
-        for (int wn = 0; wn < WPTN; wn++)
-            acc[wm][wn] = 0.0f;
-
-    float aReg[WPTM];
-    float bReg[WPTN];
-
-    int cur = 0, nxt = 1;
-    int numTiles = N_full / TSK;
-
-    // Prefetch tile 0
-    for (int wm = 0; wm < WPTM; wm++) {
-        int row = offsetM + tidm + wm*RTSM;
-        Asub[cur][tidn][tidm + wm*RTSM] = A[row*N_full + tidn];
+    int tidm = get_local_id(0);
+    int tidn = get_local_id(1);
+    int groupm = get_group_id(0);
+    int groupn = get_group_id(1);
+    
+    int offsetM = TSM * groupm + row_offset;
+    int offsetN = TSN * groupn;
+    int N4 = N_full / 4;
+    
+    // Sortie immédiate si hors limites
+    if (offsetM + tidm >= N_full || offsetN + tidn >= N_full) {
+        return;
     }
-    for (int wn = 0; wn < WPTN; wn++) {
-        int col = offsetN + tidn + wn*RTSN;
-        Bsub[cur][tidn + wn*RTSN][tidm] = B[tidm*N_full + col];
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    for (int t = 1; t < numTiles; t++) {
-        for (int wm = 0; wm < WPTM; wm++) {
-            int row = offsetM + tidm + wm*RTSM;
-            Asub[nxt][tidn][tidm + wm*RTSM] = A[row*N_full + t*TSK + tidn];
-        }
-        for (int wn = 0; wn < WPTN; wn++) {
-            int col = offsetN + tidn + wn*RTSN;
-            Bsub[nxt][tidn + wn*RTSN][tidm] = B[(t*TSK + tidm)*N_full + col];
-        }
+    
+    __local float Asub[TSK][TSM];
+    __local float Bsub[TSN][TSK];
+    
+    float acc = 0.0f;
+    
+    // Boucle sur les tiles K
+    for (int tile = 0; tile < N_full / TSK; tile++) {
+        int k_start = tile * TSK;
+        
+        // Charger A dans shared memory
         for (int k = 0; k < TSK; k++) {
-            for (int wm = 0; wm < WPTM; wm++)
-                aReg[wm] = Asub[cur][k][tidm + wm*RTSM];
-            for (int wn = 0; wn < WPTN; wn++)
-                bReg[wn] = Bsub[cur][tidn + wn*RTSN][k];
-            for (int wm = 0; wm < WPTM; wm++)
-                for (int wn = 0; wn < WPTN; wn++)
-                    acc[wm][wn] += aReg[wm] * bReg[wn];
+            int row = offsetM + tidm;
+            int col = k_start + k;
+            if (row < N_full && col < N_full) {
+                float4 a_vec = A[row * N4 + col/4];
+                if (col % 4 == 0) Asub[k][tidm] = a_vec.x;
+                else if (col % 4 == 1) Asub[k][tidm] = a_vec.y;
+                else if (col % 4 == 2) Asub[k][tidm] = a_vec.z;
+                else Asub[k][tidm] = a_vec.w;
+            }
         }
+        
+        // Charger B dans shared memory
+        for (int k = 0; k < TSK; k++) {
+            int row = k_start + k;
+            int col = offsetN + tidn;
+            if (row < N_full && col < N_full) {
+                float4 b_vec = B[row * N4 + col/4];
+                if (col % 4 == 0) Bsub[tidn][k] = b_vec.x;
+                else if (col % 4 == 1) Bsub[tidn][k] = b_vec.y;
+                else if (col % 4 == 2) Bsub[tidn][k] = b_vec.z;
+                else Bsub[tidn][k] = b_vec.w;
+            }
+        }
+        
         barrier(CLK_LOCAL_MEM_FENCE);
-        cur ^= 1; nxt ^= 1;
+        
+        // Calcul
+        for (int k = 0; k < TSK; k++) {
+            acc += Asub[k][tidm] * Bsub[tidn][k];
+        }
+        
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
-
-    // Last tile
-    for (int k = 0; k < TSK; k++) {
-        for (int wm = 0; wm < WPTM; wm++)
-            aReg[wm] = Asub[cur][k][tidm + wm*RTSM];
-        for (int wn = 0; wn < WPTN; wn++)
-            bReg[wn] = Bsub[cur][tidn + wn*RTSN][k];
-        for (int wm = 0; wm < WPTM; wm++)
-            for (int wn = 0; wn < WPTN; wn++)
-                acc[wm][wn] += aReg[wm] * bReg[wn];
+    
+    // Écriture résultat
+    int row = offsetM + tidm;
+    int col = offsetN + tidn;
+    if (row < N_full && col < N_full) {
+        C[row * N_full + col] = acc;
     }
-
-    for (int wm = 0; wm < WPTM; wm++)
-        for (int wn = 0; wn < WPTN; wn++)
-            C[(offsetM + tidm + wm*RTSM)*N_full
-              + (offsetN + tidn + wn*RTSN)] = acc[wm][wn];
 }
 """
 
-# ── Device discovery ─────────────────────────────────────────
-nvidia_device = None
-intel_gpu     = None
+# ── Device discovery (version simple) ────────────────────────
+print("\n" + "="*60)
+print("  DETECTION DES GPUS")
+print("="*60)
 
+all_devices = []
 for platform in cl.get_platforms():
     for device in platform.get_devices(cl.device_type.GPU):
-        if "NVIDIA" in device.name and nvidia_device is None:
-            nvidia_device = (platform, device)
-        elif ("Iris" in device.name or "Intel" in device.name) \
-                and intel_gpu is None:
-            intel_gpu = (platform, device)
+        all_devices.append((platform, device))
+        print(f"  Found: {device.name}")
 
-assert nvidia_device is not None, "NVIDIA GPU not found"
-assert intel_gpu     is not None, "Intel GPU not found"
+assert len(all_devices) >= 2, f"Need at least 2 GPUs, found {len(all_devices)}"
 
-p0, dev0 = nvidia_device   # RTX 3050  – NAIVE
-p1, dev1 = intel_gpu       # Iris Xe   – BEST
+p0, dev0 = all_devices[0]  # GPU 0: NAIVE
+p1, dev1 = all_devices[1]  # GPU 1: BEST
 
-print(f"Device 0 (NAIVE) : {dev0.name}")
-print(f"Device 1 (BEST)  : {dev1.name}")
+print(f"\n  GPU 0 (NAIVE kernel) : {dev0.name}")
+print(f"  GPU 1 (BEST kernel)  : {dev1.name}")
 
 # ── Allocate matrices ────────────────────────────────────────
 print(f"\nAllocating {N}×{N} matrices …")
-A     = np.random.rand(N, N).astype(np.float32)
-B     = np.random.rand(N, N).astype(np.float32)
+A = np.random.rand(N, N).astype(np.float32)
+B = np.random.rand(N, N).astype(np.float32)
 C_out = np.zeros((N, N), dtype=np.float32)
 
-# ── Step 1 : individual benchmarks (full N×N) ────────────────
+# ── Step 1 : individual benchmarks ──────────────────────────
 print("\n" + "="*60)
-print("  STEP 1 : Individual benchmarks  (N=8192, full matrix)")
+print(f"  STEP 1 : Individual benchmarks (N={N})")
 print("="*60)
 
-def bench_full(p, dev, kernel_name, local_s, global_s, label):
-    ctx   = cl.Context([dev])
-    queue = cl.CommandQueue(ctx,
-                properties=cl.command_queue_properties.PROFILING_ENABLE)
-    prog  = cl.Program(ctx, PARTIAL_KERNELS).build()
-    mf    = cl.mem_flags
-    Ab = cl.Buffer(ctx, mf.READ_ONLY  | mf.COPY_HOST_PTR, hostbuf=A)
-    Bb = cl.Buffer(ctx, mf.READ_ONLY  | mf.COPY_HOST_PTR, hostbuf=B)
-    Cb = cl.Buffer(ctx, mf.WRITE_ONLY, C_out.nbytes)
-
-    kern = getattr(prog, kernel_name)
-    kern(queue, global_s, local_s,
-         Ab, Bb, Cb, np.int32(N), np.int32(0)).wait()   # warmup
-
-    times = []
-    for _ in range(3):
-        ev = kern(queue, global_s, local_s,
-                  Ab, Bb, Cb, np.int32(N), np.int32(0))
-        ev.wait()
-        times.append((ev.profile.end - ev.profile.start) * 1e-9)
-    t  = min(times)
+def bench_full(device, kernel_name, local_s, global_s, label, use_float4=False):
+    ctx = cl.Context([device])
+    queue = cl.CommandQueue(ctx, properties=cl.command_queue_properties.PROFILING_ENABLE)
+    prog = cl.Program(ctx, PARTIAL_KERNELS).build()
+    
+    mf = cl.mem_flags
+    
+    if use_float4:
+        A_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=A)
+        B_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=B)
+        C_buf = cl.Buffer(ctx, mf.WRITE_ONLY, C_out.nbytes)
+        kern = getattr(prog, kernel_name)
+        kern(queue, global_s, local_s, A_buf, B_buf, C_buf, np.int32(N), np.int32(0)).wait()
+        
+        times = []
+        for _ in range(3):
+            ev = kern(queue, global_s, local_s, A_buf, B_buf, C_buf, np.int32(N), np.int32(0))
+            ev.wait()
+            times.append((ev.profile.end - ev.profile.start) * 1e-9)
+    else:
+        A_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=A)
+        B_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=B)
+        C_buf = cl.Buffer(ctx, mf.WRITE_ONLY, C_out.nbytes)
+        kern = getattr(prog, kernel_name)
+        kern(queue, global_s, local_s, A_buf, B_buf, C_buf, np.int32(N), np.int32(0)).wait()
+        
+        times = []
+        for _ in range(3):
+            ev = kern(queue, global_s, local_s, A_buf, B_buf, C_buf, np.int32(N), np.int32(0))
+            ev.wait()
+            times.append((ev.profile.end - ev.profile.start) * 1e-9)
+    
+    t = min(times)
     gf = 2 * N**3 / (t * 1e9)
-    print(f"  {label:38s}: {t*1000:8.2f} ms  →  {gf:8.2f} GFLOPS")
+    print(f"  {label:35s}: {t*1000:8.2f} ms  →  {gf:8.2f} GFLOPS")
     return gf
 
-gf_nvidia = bench_full(p0, dev0,
-    "matmul_naive_partial",
-    (TILE_SIZE, TILE_SIZE), (N, N),
-    "RTX 3050   – NAIVE")
+gf_gpu0 = bench_full(dev0, "matmul_naive_partial",
+                     (TILE_SIZE, TILE_SIZE), (N, N),
+                     f"{dev0.name[:20]} - NAIVE", use_float4=False)
 
-gf_intel = bench_full(p1, dev1,
-    "matmul_best_partial",
-    (RTSM, RTSN), (N * RTSM // TSM, N * RTSN // TSN),
-    "Iris Xe    – BEST (prefetch+2Dreg)")
+gf_gpu1 = bench_full(dev1, "matmul_best_partial",
+                     (RTSM, RTSN), (N * RTSM // TSM, N * RTSN // TSN),
+                     f"{dev1.name[:20]} - BEST", use_float4=True)
 
-# ── Step 2 : compute optimal row split ───────────────────────
+# ── Step 2 : optimal row split ───────────────────────────────
 print("\n" + "="*60)
 print("  STEP 2 : Optimal row split")
 print("="*60)
 
-#   Each device gets a fraction of rows proportional to its speed
-#   → both finish at the same wall-clock time
-M0_raw = int(round(gf_nvidia / (gf_nvidia + gf_intel) * N))
-M0 = max(TSM, (M0_raw // TSM) * TSM)   # align to tile boundary (TSM=128)
-if M0 >= N:
-    M0 = N - TSM
-M1 = N - M0
+total_gf = gf_gpu0 + gf_gpu1
+rows0 = int(round(gf_gpu0 / total_gf * N))
+rows0 = max(TSM, (rows0 // TSM) * TSM)
+if rows0 >= N:
+    rows0 = N - TSM
+rows1 = N - rows0
 
-frac_n = gf_nvidia / (gf_nvidia + gf_intel) * 100
-frac_i = gf_intel  / (gf_nvidia + gf_intel) * 100
-print(f"  RTX 3050  speed fraction : {frac_n:.1f}%"
-      f"  →  rows [0 .. {M0-1}]      ({M0} rows)")
-print(f"  Iris Xe   speed fraction : {frac_i:.1f}%"
-      f"  →  rows [{M0} .. {N-1}]  ({M1} rows)")
+print(f"  GPU 0 ({gf_gpu0:.1f} GFLOPS, {gf_gpu0/total_gf*100:.1f}%): {rows0} rows")
+print(f"  GPU 1 ({gf_gpu1:.1f} GFLOPS, {gf_gpu1/total_gf*100:.1f}%): {rows1} rows")
 
 # ── Step 3 : parallel execution ──────────────────────────────
 print("\n" + "="*60)
 print("  STEP 3 : Parallel execution on 2 GPUs")
 print("="*60)
 
-mf = cl.mem_flags
+# GPU 0 context
+ctx0 = cl.Context([dev0])
+queue0 = cl.CommandQueue(ctx0)
+prog0 = cl.Program(ctx0, PARTIAL_KERNELS).build()
+A_buf0 = cl.Buffer(ctx0, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=A)
+B_buf0 = cl.Buffer(ctx0, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=B)
+C_buf0 = cl.Buffer(ctx0, cl.mem_flags.WRITE_ONLY, C_out.nbytes)
 
-# RTX 3050
-ctx0   = cl.Context([dev0])
-queue0 = cl.CommandQueue(ctx0,
-             properties=cl.command_queue_properties.PROFILING_ENABLE)
-prog0  = cl.Program(ctx0, PARTIAL_KERNELS).build()
-A_buf0 = cl.Buffer(ctx0, mf.READ_ONLY  | mf.COPY_HOST_PTR, hostbuf=A)
-B_buf0 = cl.Buffer(ctx0, mf.READ_ONLY  | mf.COPY_HOST_PTR, hostbuf=B)
-C_buf0 = cl.Buffer(ctx0, mf.WRITE_ONLY, C_out.nbytes)
-
-# Intel Iris Xe
-ctx1   = cl.Context([dev1])
-queue1 = cl.CommandQueue(ctx1,
-             properties=cl.command_queue_properties.PROFILING_ENABLE)
-prog1  = cl.Program(ctx1, PARTIAL_KERNELS).build()
-A_buf1 = cl.Buffer(ctx1, mf.READ_ONLY  | mf.COPY_HOST_PTR, hostbuf=A)
-B_buf1 = cl.Buffer(ctx1, mf.READ_ONLY  | mf.COPY_HOST_PTR, hostbuf=B)
-C_buf1 = cl.Buffer(ctx1, mf.WRITE_ONLY, C_out.nbytes)
+# GPU 1 context
+ctx1 = cl.Context([dev1])
+queue1 = cl.CommandQueue(ctx1)
+prog1 = cl.Program(ctx1, PARTIAL_KERNELS).build()
+A_buf1 = cl.Buffer(ctx1, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=A)
+B_buf1 = cl.Buffer(ctx1, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=B)
+C_buf1 = cl.Buffer(ctx1, cl.mem_flags.WRITE_ONLY, C_out.nbytes)
 
 # Work sizes
-local0  = (TILE_SIZE, TILE_SIZE)
-global0 = (N, M0)                             # NVIDIA  : M0 rows
+local0 = (TILE_SIZE, TILE_SIZE)
+global0 = (N, rows0)
 
-local1  = (RTSM, RTSN)
-global1 = (M1 * RTSM // TSM, N * RTSN // TSN)  # Iris Xe : M1 rows
+local1 = (RTSM, RTSN)
+global1 = (rows1 * RTSM // TSM, N * RTSN // TSN)
+
+print("  Running parallel computation...")
 
 # Warmup
-prog0.matmul_naive_partial(queue0, global0, local0,
-    A_buf0, B_buf0, C_buf0, np.int32(N), np.int32(0)).wait()
-prog1.matmul_best_partial(queue1, global1, local1,
-    A_buf1, B_buf1, C_buf1, np.int32(N), np.int32(M0)).wait()
+prog0.matmul_naive_partial(queue0, global0, local0, A_buf0, B_buf0, C_buf0, np.int32(N), np.int32(0)).wait()
+prog1.matmul_best_partial(queue1, global1, local1, A_buf1, B_buf1, C_buf1, np.int32(N), np.int32(rows0)).wait()
 
-# Timed parallel runs
-wall_times = []
-for _ in range(3):
-    t0  = time.perf_counter()
-    ev0 = prog0.matmul_naive_partial(queue0, global0, local0,
-              A_buf0, B_buf0, C_buf0, np.int32(N), np.int32(0))
-    ev1 = prog1.matmul_best_partial(queue1, global1, local1,
-              A_buf1, B_buf1, C_buf1, np.int32(N), np.int32(M0))
-    cl.wait_for_events([ev0, ev1])           # both GPUs done
-    wall_times.append(time.perf_counter() - t0)
+# Timed run
+start = time.perf_counter()
+ev0 = prog0.matmul_naive_partial(queue0, global0, local0, A_buf0, B_buf0, C_buf0, np.int32(N), np.int32(0))
+ev1 = prog1.matmul_best_partial(queue1, global1, local1, A_buf1, B_buf1, C_buf1, np.int32(N), np.int32(rows0))
+cl.wait_for_events([ev0, ev1])
+end = time.perf_counter()
 
-t_parallel = min(wall_times)
+t_parallel = end - start
 
-# Read back and assemble C
-C_tmp0 = np.empty_like(C_out)
-C_tmp1 = np.empty_like(C_out)
-cl.enqueue_copy(queue0, C_tmp0, C_buf0);  queue0.finish()
-cl.enqueue_copy(queue1, C_tmp1, C_buf1);  queue1.finish()
-C_out[:M0, :] = C_tmp0[:M0, :]
-C_out[M0:, :] = C_tmp1[M0:, :]
+# Read back results
+C_tmp0 = np.empty((rows0, N), dtype=np.float32)
+C_tmp1 = np.empty((rows1, N), dtype=np.float32)
+cl.enqueue_copy(queue0, C_tmp0, C_buf0).wait()
+cl.enqueue_copy(queue1, C_tmp1, C_buf1).wait()
 
-# ── Results ───────────────────────────────────────────────────
+C_out[:rows0, :] = C_tmp0
+C_out[rows0:, :] = C_tmp1
+
+# Results
 gf_parallel = 2 * N**3 / (t_parallel * 1e9)
-speedup     = gf_parallel / gf_nvidia
-
-print(f"\n  RTX 3050 alone (NAIVE)     : {gf_nvidia:8.2f} GFLOPS  ← reference")
-print(f"  Iris Xe  alone (BEST)      : {gf_intel:8.2f} GFLOPS")
-print(f"  Parallel wall time         : {t_parallel*1000:8.2f} ms")
-print(f"  Parallel throughput        : {gf_parallel:8.2f} GFLOPS")
-print(f"\n  Speedup = {gf_parallel:.2f} / {gf_nvidia:.2f} = {speedup:.2f}×")
+speedup = gf_parallel / gf_gpu0
 
 print("\n" + "="*60)
-print(f"  {'GPU':<22} {'Kernel':<22} {'GFLOPS':>10}")
-print(f"  {'-'*56}")
-print(f"  {'RTX 3050':<22} {'NAIVE':<22} {gf_nvidia:>10.2f}")
-print(f"  {'Iris Xe':<22} {'BEST (K9)':<22} {gf_intel:>10.2f}")
-print(f"  {'2 GPUs combined':<22} {'parallel':<22} {gf_parallel:>10.2f}")
-print(f"  {'Speedup':<44} {speedup:>10.2f}×")
+print("  RESULTS")
 print("="*60)
+print(f"\n  GPU 0 alone (NAIVE)     : {gf_gpu0:8.2f} GFLOPS")
+print(f"  GPU 1 alone (BEST)      : {gf_gpu1:8.2f} GFLOPS")
+print(f"  Parallel wall time      : {t_parallel*1000:8.2f} ms")
+print(f"  Parallel throughput     : {gf_parallel:8.2f} GFLOPS")
+print(f"\n  SPEEDUP = {speedup:.2f}x")
+
+print("\n" + "="*60)
+print("="*60)
+
+
+import sys
+sys.stdout.flush()
