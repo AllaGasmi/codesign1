@@ -368,88 +368,76 @@ __kernel void matmul_wider_register(
               + (offsetN + tidn + wn*RTSN)] = acc[wm][wn];
 }
 
-// ---------------------------------------------------------
-// KERNEL 9 : BEST – double-buffer prefetch + 2-D register
-//   Overlaps tile loading (next tile) with MAD (current tile)
-//   using a ping-pong double buffer in shared memory.
-//   This is the recommended BEST kernel for Part B.
-// ---------------------------------------------------------
 __kernel void matmul_best(
-    __global float* A,
-    __global float* B,
-    __global float* C,
+    __global float4* A,
+    __global float4* B,
+    __global float*  C,
     int N)
 {
-    __local float Asub[2][TSK][TSM];
-    __local float Bsub[2][TSN][TSK];
-
-    int tidm    = get_local_id(0);
-    int tidn    = get_local_id(1);
-    int offsetM = TSM * get_group_id(0);
-    int offsetN = TSN * get_group_id(1);
-
-    float acc[WPTM][WPTN];
-    for (int wm = 0; wm < WPTM; wm++)
-        for (int wn = 0; wn < WPTN; wn++)
-            acc[wm][wn] = 0.0f;
-
-    float aReg[WPTM];
-    float bReg[WPTN];
-
-    int cur = 0, nxt = 1;
-    int numTiles = N / TSK;
-
-    // Prefetch tile 0
-    for (int wm = 0; wm < WPTM; wm++) {
-        int row = offsetM + tidm + wm*RTSM;
-        Asub[cur][tidn][tidm + wm*RTSM] = A[row*N + tidn];
+    int tidm = get_local_id(0);
+    int tidn = get_local_id(1);
+    int groupm = get_group_id(0);
+    int groupn = get_group_id(1);
+    
+    int offsetM = TSM * groupm;
+    int offsetN = TSN * groupn;
+    int N4 = N / 4;
+    
+    // Sortie immédiate si hors limites
+    if (offsetM + tidm >= N || offsetN + tidn >= N) {
+        return;
     }
-    for (int wn = 0; wn < WPTN; wn++) {
-        int col = offsetN + tidn + wn*RTSN;
-        Bsub[cur][tidn + wn*RTSN][tidm] = B[tidm*N + col];
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    for (int t = 1; t < numTiles; t++) {
-
-        // Load next tile while computing current
-        for (int wm = 0; wm < WPTM; wm++) {
-            int row = offsetM + tidm + wm*RTSM;
-            Asub[nxt][tidn][tidm + wm*RTSM] = A[row*N + t*TSK + tidn];
-        }
-        for (int wn = 0; wn < WPTN; wn++) {
-            int col = offsetN + tidn + wn*RTSN;
-            Bsub[nxt][tidn + wn*RTSN][tidm] = B[(t*TSK + tidm)*N + col];
-        }
-
-        // Compute tile t-1
+    
+    __local float Asub[TSK][TSM];
+    __local float Bsub[TSN][TSK];
+    
+    float acc = 0.0f;
+    
+    // Boucle sur les tiles K
+    for (int tile = 0; tile < N / TSK; tile++) {
+        int k_start = tile * TSK;
+        
+        // Charger A dans shared memory
         for (int k = 0; k < TSK; k++) {
-            for (int wm = 0; wm < WPTM; wm++)
-                aReg[wm] = Asub[cur][k][tidm + wm*RTSM];
-            for (int wn = 0; wn < WPTN; wn++)
-                bReg[wn] = Bsub[cur][tidn + wn*RTSN][k];
-            for (int wm = 0; wm < WPTM; wm++)
-                for (int wn = 0; wn < WPTN; wn++)
-                    acc[wm][wn] += aReg[wm] * bReg[wn];
+            int row = offsetM + tidm;
+            int col = k_start + k;
+            if (row < N && col < N) {
+                float4 a_vec = A[row * N4 + col/4];
+                // Accès correct aux composants d'un float4
+                if (col % 4 == 0) Asub[k][tidm] = a_vec.x;
+                else if (col % 4 == 1) Asub[k][tidm] = a_vec.y;
+                else if (col % 4 == 2) Asub[k][tidm] = a_vec.z;
+                else Asub[k][tidm] = a_vec.w;
+            }
         }
-
+        
+        // Charger B dans shared memory
+        for (int k = 0; k < TSK; k++) {
+            int row = k_start + k;
+            int col = offsetN + tidn;
+            if (row < N && col < N) {
+                float4 b_vec = B[row * N4 + col/4];
+                if (col % 4 == 0) Bsub[tidn][k] = b_vec.x;
+                else if (col % 4 == 1) Bsub[tidn][k] = b_vec.y;
+                else if (col % 4 == 2) Bsub[tidn][k] = b_vec.z;
+                else Bsub[tidn][k] = b_vec.w;
+            }
+        }
+        
         barrier(CLK_LOCAL_MEM_FENCE);
-        cur ^= 1; nxt ^= 1;
+        
+        // Calcul
+        for (int k = 0; k < TSK; k++) {
+            acc += Asub[k][tidm] * Bsub[tidn][k];
+        }
+        
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
-
-    // Compute last tile
-    for (int k = 0; k < TSK; k++) {
-        for (int wm = 0; wm < WPTM; wm++)
-            aReg[wm] = Asub[cur][k][tidm + wm*RTSM];
-        for (int wn = 0; wn < WPTN; wn++)
-            bReg[wn] = Bsub[cur][tidn + wn*RTSN][k];
-        for (int wm = 0; wm < WPTM; wm++)
-            for (int wn = 0; wn < WPTN; wn++)
-                acc[wm][wn] += aReg[wm] * bReg[wn];
+    
+    // Écriture résultat
+    int row = offsetM + tidm;
+    int col = offsetN + tidn;
+    if (row < N && col < N) {
+        C[row * N + col] = acc;
     }
-
-    for (int wm = 0; wm < WPTM; wm++)
-        for (int wn = 0; wn < WPTN; wn++)
-            C[(offsetM + tidm + wm*RTSM)*N
-              + (offsetN + tidn + wn*RTSN)] = acc[wm][wn];
 }
